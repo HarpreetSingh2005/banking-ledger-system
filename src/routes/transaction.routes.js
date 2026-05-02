@@ -4,7 +4,7 @@ const transactionRoutes = express.Router();
 const transactionController = require("../controllers/transaction.controller");
 const authMiddleware = require("../middleware/auth.middleware");
 
-router.post(
+transactionRoutes.post(
   "/",
   authMiddleware.authMiddleware,
   transactionController.createTransactionController,

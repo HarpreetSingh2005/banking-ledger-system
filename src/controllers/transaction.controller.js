@@ -1,5 +1,7 @@
 const ledgerModel = require("../models/ledger.model");
 const transactionModel = require("../models/transaction.model");
+const accountModel = require("../models/account.model");
+const mongoose = require("mongoose");
 
 const emailServices = require("../services/email.services");
 
@@ -17,8 +19,159 @@ const emailServices = require("../services/email.services");
  * - 10. Send email notification
  */
 
-function createTransactionController(req, res) {
+async function createTransactionController(req, res) {
   const { fromAccount, toAccount, amount, idempotencyKey } = req.body;
+
+  /**
+   * 1. Validate request
+   */
+  if (!fromAccount || !toAccount || !amount || !idempotencyKey) {
+    return res.status(400).json({
+      message: "FromAccount, ToAccount, Amount and IdempotencyKey are required",
+    });
+  }
+
+  const fromAccountExist = await accountModel.findOne({ _id: fromAccount });
+  const toAccountExist = await accountModel.findOne({ _id: toAccount });
+
+  if (!fromAccountExist || !toAccountExist) {
+    return res.status(400).json({ message: "Account not found" });
+  }
+
+  /**
+   * 2. Validate the idempotency key
+   */
+
+  const isTransactionExist = await transactionModel.findOne({
+    idempotencyKey: idempotencyKey,
+  });
+
+  if (isTransactionExist) {
+    if (isTransactionExist.status == "COMPLETED") {
+      return res.status(200).json({ message: "Transaction already completed" });
+    }
+    if (isTransactionExist.status == "PENDING") {
+      return res
+        .status(200)
+        .json({ message: "Transaction exists and is pending" });
+    }
+    if (isTransactionExist.status == "FAILED") {
+      return res.status(500).json({ message: "Transaction failed" });
+    }
+    if (isTransactionExist.status == "REVERSED") {
+      return res.status(500).json({ message: "Transaction was reversed" });
+    }
+  }
+  /**
+   * 3. Check account status
+   */
+
+  if (
+    fromAccountExist.status != "ACTIVE" ||
+    toAccountExist.status != "ACTIVE"
+  ) {
+    return res.status(400).json({
+      message:
+        "Both From Account and To Account must be Active for transaction",
+    });
+  }
+
+  /**
+   * 4. Derive sender balance from ledger
+   */
+  const balance = await fromAccountExist.getBalance();
+  if (balance < amount) {
+    return res.status(400).json({
+      message: `Insufficient balance. Current balance is ${balance}. Transaction amount is ${amount}`,
+    });
+  }
+
+  let transaction;
+
+  try {
+    /**
+     * 5. Create a transaction (Pending)
+     */
+    const session = await mongoose.startSession();
+    await session.startTransaction();
+
+    transaction = (
+      await transactionModel.create(
+        [
+          {
+            fromAccount,
+            toAccount,
+            amount,
+            idempotencyKey,
+            status: "PENDING",
+          },
+        ],
+        { session },
+      )
+    )[0];
+
+    /**
+     * 6. Create a ledger entry for the Debit
+     */
+    const debitLedgerEntry = await ledgerModel.create(
+      [
+        {
+          account: fromAccount,
+          transaction: transaction._id,
+          amount: amount,
+          type: "DEBIT",
+        },
+      ],
+      { session },
+    );
+
+    /**
+     * 7. Create a ledger entry for the Credit
+     */
+    const creditLedgerEntry = await ledgerModel.create(
+      [
+        {
+          account: toAccount,
+          transaction: transaction._id,
+          amount: amount,
+          type: "CREDIT",
+        },
+      ],
+      { session },
+    );
+
+    /**
+     * 8. Mark the transaction as completed
+     */
+    await transactionModel.findOneAndUpdate(
+      { _id: transaction._id },
+      { status: "COMPLETED" },
+      { session },
+    );
+
+    await transaction.commitTransaction();
+    session.endSession();
+  } catch (err) {
+    return res.status(400).json({
+      message:
+        "Transaction is Pending due to some issue, please retry after sometime",
+    });
+  }
+
+  /**
+   * 10. Send email notification
+   */
+
+  await emailServices.sendTransactionEmail(
+    fromAccountExist.email,
+    fromAccountExist.name,
+    toAccountExist.name,
+    amount,
+  );
+
+  return res
+    .status(201)
+    .json({ message: "Transaction successful", transaction: transaction });
 }
 
 module.exports = { createTransactionController };
